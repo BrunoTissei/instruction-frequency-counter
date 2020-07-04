@@ -17,9 +17,9 @@ std::string log_name_prefix;
 std::string log_name_suffix;
 
 
-/* ===================================================================== */
-/* Instruction Parsing Utilities                                         */
-/* ===================================================================== */
+/* =========================================================================== */
+/* Instruction Parsing Utilities                                               */
+/* =========================================================================== */
 
 std::unordered_map<std::string,std::string> iclass_from_icode;
 
@@ -30,10 +30,17 @@ std::string get_instruction_icode(xed_decoded_inst_t *xedd) {
     const xed_inst_t* xi = xed_decoded_inst_inst(xedd);
     const unsigned int noperands = xed_inst_noperands(xi);
 
-    std::string iclass = std::string(xed_iclass_enum_t2str(xed_decoded_inst_get_iclass(xedd)));
-    std::string icode  = std::string(xed_iform_enum_t2str(xed_decoded_inst_get_iform_enum(xedd)));
+    // Iclass is also logged in result file
+    std::string iclass = std::string(
+        xed_iclass_enum_t2str(xed_decoded_inst_get_iclass(xedd))
+    );
 
     // Icode consists of: iform + {operand_i}{width_i}...
+    std::string icode  = std::string(
+        xed_iform_enum_t2str(xed_decoded_inst_get_iform_enum(xedd))
+    );
+
+    // Iterate over every operand
     for (unsigned int i = 0; i < noperands; ++i) {
         const xed_operand_t* op = xed_inst_operand(xi, i);
         const xed_operand_enum_t op_name = xed_operand_name(op);
@@ -83,10 +90,12 @@ std::string get_instruction_icode(xed_decoded_inst_t *xedd) {
                 break;
             }
             default:
+                // The default option should never occur a error is logged
                 if (!error_log.is_open()) {
                     std::string error_log_name = log_name_prefix + "_error.log";
                     error_log.open(error_log_name.c_str(), std::ios_base::app);
                 }
+
                 error_log << "Unknown operator: " << icode << '\n';
                 error_log.close();
         }
@@ -105,31 +114,9 @@ std::string get_instruction_icode(xed_decoded_inst_t *xedd) {
 }
 
 
-/* ===================================================================== */
-/* Thread Local Storage Utilities                                        */
-/* ===================================================================== */
-
-// Padding is used to avoid false sharing
-// 64 byte line size: 64 - 56 (sizeof(unordered_map<std::string,uint64_t>))
-#define PADSIZE 8
-
-struct thread_data_t {
-    std::unordered_map<std::string,uint64_t> counter;
-    UINT8 _pad[PADSIZE];
-};
-
-static TLS_KEY tls_key;
-
-// Returns thread local storage (TLS)
-thread_data_t* get_tls(THREADID thread_id) {
-    thread_data_t *tdata = static_cast<thread_data_t*>(PIN_GetThreadData(tls_key, thread_id));
-    return tdata;
-}
-
-
-/* ===================================================================== */
-/* Analysis routines                                                     */
-/* ===================================================================== */
+/* =========================================================================== */
+/* Thread Local Storage Utilities                                              */
+/* =========================================================================== */
 
 // Custom hash for faster usage of unordered_map
 struct custom_hash_t {
@@ -146,53 +133,82 @@ struct custom_hash_t {
     }
 };
 
-std::unordered_map<uint64_t,std::string,custom_hash_t> address_icode;
+// Padding is used to avoid false sharing
+// 64 byte line size: 64 - 56 (sizeof(unordered_map))
+#define PADSIZE 8
 
-// Function that executes before every instruction is executed
-VOID record_instruction(ADDRINT addr, THREADID thread_id) {
-    thread_data_t* tdata = get_tls(thread_id);
+struct thread_data_t {
+    std::unordered_map<uint64_t, uint64_t, custom_hash_t> counter;
+    UINT8 _pad[PADSIZE];
+};
 
-    // Increases instrucion counter at thread's hash table
-    tdata->counter[address_icode[(uint64_t) addr]] += 1;
+static TLS_KEY tls_key;
+
+// Returns thread local storage (TLS)
+inline thread_data_t* get_tls(THREADID thread_id) {
+    thread_data_t *tdata = static_cast<thread_data_t*>(
+        PIN_GetThreadData(tls_key, thread_id)
+    );
+    return tdata;
 }
 
 
-/* ===================================================================== */
-/* Instrumentation routines                                              */
-/* ===================================================================== */
+/* =========================================================================== */
+/* Analysis routines                                                           */
+/* =========================================================================== */
 
-// Executes on every static instruction
-VOID Instruction(INS ins, VOID *v) {
-    if (INS_hasKnownMemorySize(ins)) {
+// Executes before every basic block (BBL) is executed dynamically
+VOID record_bbl(uint64_t addr, THREADID thread_id) {
+    thread_data_t *tdata = get_tls(thread_id);
 
-        // Associates address of each static instruction with
-        // parsed name of instruction (icode) using a hash table.
-        // This is necessary in order to retrive the icode from inside
-        // the analysis routine (record_instruction).
-        xed_decoded_inst_t* xedd = INS_XedDec(ins);
-        std::string code = get_instruction_icode(xedd);
+    // Count BBL occurence and stores inside TLS's counter
+    tdata->counter[addr] += 1;
+}
 
-        address_icode[INS_Address(ins)] = code;
 
-        // Inserts function to be executed before every instruction
-        INS_InsertCall(ins, IPOINT_BEFORE,
-                       (AFUNPTR) record_instruction,
-                       IARG_INST_PTR, IARG_THREAD_ID,
+/* =========================================================================== */
+/* Instrumentation routines                                                    */
+/* =========================================================================== */
+
+std::unordered_map<
+    uint64_t, std::unordered_map<std::string, uint64_t>, custom_hash_t
+> result_by_bbl;
+
+// Iterates over all BBLs
+VOID Trace(TRACE trace, VOID *v) {
+    for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl)) {
+        uint64_t bbl_address = BBL_Address(bbl);
+
+        auto bbl_counter = &(result_by_bbl[(uint64_t) bbl_address]);
+        bbl_counter->clear();
+
+        // Register analysis routine
+        BBL_InsertCall(bbl, IPOINT_ANYWHERE,
+                       (AFUNPTR) record_bbl,
+                       IARG_UINT64, bbl_address,
+                       IARG_THREAD_ID,
                        IARG_END);
+
+        // Count instructions per BBL and store that as a partial result
+        for (INS ins = BBL_InsHead(bbl); INS_Valid(ins); ins = INS_Next(ins)) {
+            xed_decoded_inst_t *xedd = INS_XedDec(ins);
+            std::string code = get_instruction_icode(xedd);
+
+            (*bbl_counter)[code] += 1;
+        }
     }
 }
 
 
-/* ===================================================================== */
-/* Callback Routines                                                     */
-/* ===================================================================== */
+/* =========================================================================== */
+/* Callback Routines                                                           */
+/* =========================================================================== */
 
 PIN_LOCK lock;
 INT32 num_threads = 0;
 
 // Creates a thread data holder every time a thread starts
 VOID ThreadStart(THREADID thread_id, CONTEXT *ctxt, INT32 flags, VOID *v) {
-
     PIN_GetLock(&lock, thread_id + 1);
     num_threads++;
     PIN_ReleaseLock(&lock);
@@ -213,7 +229,8 @@ VOID ImageLoad(IMG img, VOID *v) {
         exec_name = exec_name.substr(exec_name.rfind('/') + 1);
         log_name_prefix = exec_name;
 
-        std::cerr << "[PIN] Initializing analysis for " << exec_name << std::endl;
+        std::cerr << "[PIN] Initializing analysis for " << exec_name <<
+            std::endl;
 
         // Log name suffix contains timestamp
         std::ostringstream slog_name_suffix;
@@ -225,18 +242,23 @@ VOID ImageLoad(IMG img, VOID *v) {
 
 // Executes when program is finished
 VOID Finish(INT32 code, VOID *v) {
-    std::unordered_map<std::string,uint64_t> total_counter;
+    std::map<std::string, uint64_t> total_counter;
 
-    std::cerr << "[PIN] Joining results from all " << num_threads << " threads." << std::endl;
+    std::cerr << "[PIN] Joining results from all " <<
+        num_threads << " threads." << std::endl;
 
     // Aggregate data from all threads into "total_counter"
     for (int i = 0; i < num_threads; ++i) {
         thread_data_t* tdata = get_tls(i);
+
         for (auto &j : tdata->counter) {
-            total_counter[j.first] += j.second;
+            auto bbl_counter_ptr = &(result_by_bbl[j.first]);
+
+            for (auto &k : (*bbl_counter_ptr)) {
+                total_counter[k.first] += (k.second * j.second);
+            }
         }
     }
-
 
     // Insert process id into file name
     std::ostringstream slog_name;
@@ -262,9 +284,9 @@ VOID Finish(INT32 code, VOID *v) {
 }
 
 
-/* ===================================================================== */
-/* Main                                                                  */
-/* ===================================================================== */
+/* =========================================================================== */
+/* Main                                                                        */
+/* =========================================================================== */
 
 int main(int argc, char **argv) {
     PIN_InitSymbols();
@@ -275,16 +297,17 @@ int main(int argc, char **argv) {
 
     xed_tables_init();
 
-
     tls_key = PIN_CreateThreadDataKey(0);
+
 
     IMG_AddInstrumentFunction(ImageLoad, 0);
 
     PIN_AddThreadStartFunction(ThreadStart, 0);
 
-    INS_AddInstrumentFunction(Instruction, 0);
+    TRACE_AddInstrumentFunction(Trace, 0);
 
     PIN_AddFiniFunction(Finish, 0);
+
 
     PIN_StartProgram();
 
